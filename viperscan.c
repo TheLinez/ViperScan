@@ -9,7 +9,7 @@
 #include <sys/time.h>
 
 #define MAX_THREADS 100
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 
 int verbose = 0;
 int ping_only = 0;
@@ -17,94 +17,85 @@ int scan_all_ports = 0;
 int custom_ports_count = 0;
 int custom_ports[100];
 
-typedef struct {
-    char target_ip[100];
-    int port;
-} scan_task_t;
+char global_target_ip[100];
+int current_port_index = 0;
+int total_ports_to_scan = 0;
+int* ports_queue = NULL;
+
+char output_filename[256] = "";
+FILE* output_file = NULL;
+
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void print_help(const char* prog_name) {
-    printf("VIPERSCAN v%s - Custom Network Scanner\n\n", VERSION);
+    printf("VIPERSCAN v%s\n\n", VERSION);
     printf("Usage:\n");
     printf("  %s <target> [start_port end_port] [options]\n", prog_name);
     printf("  %s -v\n\n", prog_name);
     printf("Options:\n");
     printf("  -help    Show this help message\n");
-    printf("  -v       If target specified: Verbose mode (shows closed ports too)\n");
-    printf("           If used alone: Show tool version\n");
+    printf("  -v       Verbose mode (shows closed ports too / tool version)\n");
     printf("  -sn      Ping Scan (Host discovery only)\n");
     printf("  -p-      Scan all 65535 ports\n");
-    printf("  -p       Scan specific ports (e.g., -p 80,443)\n\n");
-    printf("Examples:\n");
-    printf("  vscan 127.0.0.1 1 1024\n");
-    printf("  vscan google.com -p 80,443 -v\n");
+    printf("  -p       Scan specific ports (e.g., -p 80,443)\n");
+    printf("  -oN      Save scan results to a text file (e.g., -oN res.txt)\n\n");
 }
 
-void* scan_port(void* arg) {
-    scan_task_t* task = (scan_task_t*)arg;
-    int sock;
+void* worker_thread(void* arg) {
+    int port;
     struct sockaddr_in server_addr;
-
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        free(task);
-        pthread_exit(NULL);
-    }
-
     struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 500000;
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(task->port);
-    inet_pton(AF_INET, task->target_ip, &server_addr.sin_addr);
+    inet_pton(AF_INET, global_target_ip, &server_addr.sin_addr);
 
-    if (verbose) {
-        printf("[*] Checking port %d/TCP...\n", task->port);
-    }
+    while (1) {
+        pthread_mutex_lock(&queue_mutex);
+        if (current_port_index >= total_ports_to_scan) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+        port = ports_queue[current_port_index++];
+        pthread_mutex_unlock(&queue_mutex);
 
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
-        struct servent *se = getservbyport(htons(task->port), "tcp");
-        printf("[+] Port %d/TCP is OPEN   --> Service: %s\n", 
-               task->port, se ? se->s_name : "unknown");
-    } else {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        server_addr.sin_port = htons(port);
+
         if (verbose) {
-            printf("[-] Port %d/TCP is closed\n", task->port);
-        }
-    }
-
-    close(sock);
-    free(task);
-    pthread_exit(NULL);
-}
-
-int run_port_scan(const char* target_ip, int start, int end) {
-    pthread_t threads[MAX_THREADS];
-    int thread_count = 0;
-
-    for (int port = start; port <= end; port++) {
-        scan_task_t* task = (scan_task_t*)malloc(sizeof(scan_task_t));
-        strcpy(task->target_ip, target_ip);
-        task->port = port;
-
-        if (pthread_create(&threads[thread_count], NULL, scan_port, (void*)task) == 0) {
-            thread_count++;
+            printf("[*] Checking port %d/TCP...\n", port);
         }
 
-        if (thread_count >= MAX_THREADS) {
-            for (int i = 0; i < thread_count; i++) {
-                pthread_join(threads[i], NULL);
+        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+            struct servent *se = getservbyport(htons(port), "tcp");
+            
+            pthread_mutex_lock(&file_mutex);
+            printf("[+] Port %d/TCP is OPEN   --> Service: %s\n", 
+                   port, se ? se->s_name : "unknown");
+            
+            if (output_file != NULL) {
+                fprintf(output_file, "[+] Port %d/TCP is OPEN   --> Service: %s\n", 
+                        port, se ? se->s_name : "unknown");
+                fflush(output_file);
             }
-            thread_count = 0;
+            pthread_mutex_unlock(&file_mutex);
+        } else {
+            if (verbose) {
+                printf("[-] Port %d/TCP is closed\n", port);
+            }
         }
+        close(sock);
     }
-
-    for (int i = 0; i < thread_count; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    return 0;
+    return NULL;
 }
 
 int main(int argc, char* argv[]) {
@@ -131,7 +122,6 @@ int main(int argc, char* argv[]) {
     char* target = argv[1];
     if (target[0] == '-') {
         printf("[!] Error: Target host must be specified first.\n");
-        print_help("vscan");
         return 1;
     }
 
@@ -161,24 +151,38 @@ int main(int argc, char* argv[]) {
                 token = strtok(NULL, ",");
             }
             i++;
+        } else if (strcmp(argv[i], "-oN") == 0 && i + 1 < argc) {
+            strncpy(output_filename, argv[i + 1], sizeof(output_filename) - 1);
+            i++;
         }
     }
 
+    if (strlen(output_filename) > 0) {
+        output_file = fopen(output_filename, "w");
+        if (output_file == NULL) {
+            printf("[!] Error: Could not create output file %s\n", output_filename);
+            return 1;
+        }
+        fprintf(output_file, "# VIPERSCAN v%s Scan Report\n", VERSION);
+        fprintf(output_file, "# Target: %s\n\n", target);
+    }
+
     printf("--------------------------------------------------\n");
-    printf("   🐍 VIPERSCAN v%s — Custom Network Scanner\n", VERSION);
+    printf("   🐍 VIPERSCAN v%s\n", VERSION);
     printf("--------------------------------------------------\n");
 
     struct hostent *he;
-    char target_ip[100];
     if ((he = gethostbyname(target)) == NULL) {
         herror("[!] DNS Error");
+        if (output_file != NULL) fclose(output_file);
         return 1;
     }
     struct in_addr **addr_list = (struct in_addr **)he->h_addr_list;
-    strcpy(target_ip, inet_ntoa(*addr_list[0]));
+    strcpy(global_target_ip, inet_ntoa(**addr_list));
 
-    printf("[*] Target Host: %s (%s)\n", target, target_ip);
+    printf("[*] Target Host: %s (%s)\n", target, global_target_ip);
     if (verbose) printf("[*] Verbose mode: ENABLED\n");
+    if (output_file != NULL) printf("[*] Output file: %s\n", output_filename);
 
     if (ping_only) {
         printf("[*] Mode: Ping Scan (-sn)\n");
@@ -191,43 +195,44 @@ int main(int argc, char* argv[]) {
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(80);
-        inet_pton(AF_INET, target_ip, &server_addr.sin_addr);
+        inet_pton(AF_INET, global_target_ip, &server_addr.sin_addr);
 
-        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0 || verbose) {
-            printf("[+] Host %s seems to be ALIVE.\n", target_ip);
+        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+            printf("[+] Host %s seems to be ALIVE.\n", global_target_ip);
+            if (output_file != NULL) fprintf(output_file, "[+] Host %s seems to be ALIVE.\n", global_target_ip);
         } else {
-            printf("[-] Host %s could not be reached via standard ports.\n", target_ip);
+            printf("[-] Host %s could not be verified via standard TCP ports.\n", global_target_ip);
+            if (output_file != NULL) fprintf(output_file, "[-] Host %s could not be verified.\n", global_target_ip);
         }
         close(sock);
-    } else if (custom_ports_count > 0) {
-        printf("[*] Scanning specific ports: %d custom ports\n", custom_ports_count);
-        printf("--------------------------------------------------\n");
-        pthread_t threads[MAX_THREADS];
-        int thread_count = 0;
-
-        for (int i = 0; i < custom_ports_count; i++) {
-            scan_task_t* task = (scan_task_t*)malloc(sizeof(scan_task_t));
-            strcpy(task->target_ip, target_ip);
-            task->port = custom_ports[i];
-
-            if (pthread_create(&threads[thread_count], NULL, scan_port, (void*)task) == 0) {
-                thread_count++;
+    } else {
+        if (custom_ports_count > 0) {
+            total_ports_to_scan = custom_ports_count;
+            ports_queue = (int*)malloc(total_ports_to_scan * sizeof(int));
+            for (int i = 0; i < custom_ports_count; i++) {
+                ports_queue[i] = custom_ports[i];
             }
-
-            if (thread_count >= MAX_THREADS) {
-                for (int j = 0; j < thread_count; j++) {
-                    pthread_join(threads[j], NULL);
-                }
-                thread_count = 0;
+            printf("[*] Scanning specific ports: %d custom ports\n", total_ports_to_scan);
+        } else {
+            total_ports_to_scan = end_port - start_port + 1;
+            ports_queue = (int*)malloc(total_ports_to_scan * sizeof(int));
+            for (int i = 0; i < total_ports_to_scan; i++) {
+                ports_queue[i] = start_port + i;
             }
+            printf("[*] Scanning range: %d - %d\n", start_port, end_port);
         }
-        for (int i = 0; i < thread_count; i++) {
+        printf("--------------------------------------------------\n");
+
+        pthread_t threads[MAX_THREADS];
+        for (int i = 0; i < MAX_THREADS; i++) {
+            pthread_create(&threads[i], NULL, worker_thread, NULL);
+        }
+
+        for (int i = 0; i < MAX_THREADS; i++) {
             pthread_join(threads[i], NULL);
         }
-    } else {
-        printf("[*] Scanning range: %d - %d\n", start_port, end_port);
-        printf("--------------------------------------------------\n");
-        run_port_scan(target_ip, start_port, end_port);
+
+        free(ports_queue);
     }
 
     gettimeofday(&end_time, NULL);
@@ -236,5 +241,11 @@ int main(int argc, char* argv[]) {
 
     printf("--------------------------------------------------\n");
     printf("[*] Scan complete. Time elapsed: %.2f seconds.\n", elapsed_time);
+    
+    if (output_file != NULL) {
+        fprintf(output_file, "\n# Scan complete. Time elapsed: %.2f seconds.\n", elapsed_time);
+        fclose(output_file);
+    }
+    
     return 0;
 }
